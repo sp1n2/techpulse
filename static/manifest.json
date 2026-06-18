@@ -1,0 +1,15 @@
+{
+  "name": "TechPulse",
+  "short_name": "TechPulse",
+  "description": "AI-first tech news briefing tool powered by Claude",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "portrait-primary",
+  "theme_color": "#6366f1",
+  "background_color": "#0a0e1a",
+  "icons": [
+    { "src": "/static/icon-192.png", "sizes": "192x192", "type": "image/png" },
+    { "src": "/static/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any maskable" }
+  ]
+}
