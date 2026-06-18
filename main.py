@@ -1,8 +1,11 @@
 import hashlib
 import json
+import logging
 import re
 import time
 import urllib.request
+from asyncio import get_running_loop
+from contextlib import asynccontextmanager
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import AsyncGenerator, Optional
 
@@ -13,8 +16,12 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-app = FastAPI(title="TechPulse")
-app.mount("/static", StaticFiles(directory="static"), name="static")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+    datefmt="%H:%M:%S",
+)
+log = logging.getLogger("techpulse")
 
 # ─── Config ───────────────────────────────────────────────────────────────────
 
@@ -27,6 +34,9 @@ RSS_SOURCES = [
     {"name": "TechCrunch",        "url": "https://techcrunch.com/feed/"},
     {"name": "Bleeping Computer", "url": "https://www.bleepingcomputer.com/feed/"},
 ]
+
+# Browser-like UA — many feeds block python-feedparser's default UA
+RSS_UA = "Mozilla/5.0 (compatible; TechPulse/2.0; +https://github.com/sp1n2/techpulse)"
 
 CATEGORY_KW: dict[str, list[str]] = {
     "ai":       ["ai", "artificial intelligence", "machine learning", "llm", "gpt", "chatgpt",
@@ -54,14 +64,21 @@ _SKIP_PREFIXES = ("Ask HN:", "Show HN:", "Who is hiring", "Tell HN:", "Launch HN
 _SKIP_DOMAINS  = ("reddit.com", "old.reddit.com", "i.redd.it", "v.redd.it")
 _SKIP_PATHS    = ("news.ycombinator.com/item",)
 
-_cache: dict = {"articles": [], "alerts": [], "ts": 0.0}
+_cache: dict = {
+    "articles":      [],
+    "alerts":        [],
+    "ts":            0.0,
+    "errors":        [],
+    "fetch_count":   0,
+    "source_counts": {},
+}
 
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
 def _fetch_json(url: str):
-    req = urllib.request.Request(url, headers={"User-Agent": "TechPulse/2.0"})
-    with urllib.request.urlopen(req, timeout=8) as r:
+    req = urllib.request.Request(url, headers={"User-Agent": RSS_UA})
+    with urllib.request.urlopen(req, timeout=10) as r:
         return json.loads(r.read())
 
 
@@ -111,12 +128,31 @@ def _hn_item(sid: int) -> Optional[dict]:
 
 # ─── RSS ──────────────────────────────────────────────────────────────────────
 
-def _rss_source(source: dict) -> list[dict]:
+def _rss_source(source: dict) -> tuple[list[dict], Optional[str]]:
+    """Fetch one RSS feed. Returns (articles, error_message_or_None)."""
+    name = source["name"]
     try:
-        feed = feedparser.parse(source["url"])
-        out  = []
+        req = urllib.request.Request(
+            source["url"],
+            headers={
+                "User-Agent": RSS_UA,
+                "Accept": "application/rss+xml, application/atom+xml, application/xml, text/xml, */*",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=10) as r:
+            raw_bytes = r.read()
+
+        feed = feedparser.parse(raw_bytes)
+
+        if not feed.entries:
+            bozo_msg = str(feed.get("bozo_exception", "")) if feed.get("bozo") else ""
+            detail = f"0 entries — bozo: {bozo_msg}" if bozo_msg else "0 entries returned"
+            log.warning(f"[RSS] {name}: {detail}")
+            return [], detail
+
+        out = []
         for e in feed.entries[:15]:
-            raw   = e.get("summary") or next((c.get("value","") for c in e.get("content",[])), "")
+            raw   = e.get("summary") or next((c.get("value", "") for c in e.get("content", [])), "")
             clean = re.sub(r"<[^>]+>", " ", raw).strip()
             words = len(clean.split())
             desc  = re.sub(r"\s+", " ", clean)[:200]
@@ -125,45 +161,69 @@ def _rss_source(source: dict) -> list[dict]:
             url   = e.get("link", "")
             out.append({
                 "id":          f"rss-{hashlib.md5(url.encode()).hexdigest()[:10]}",
-                "source":      source["name"],
+                "source":      name,
                 "source_type": "rss",
                 "title":       e.get("title", "Untitled"),
                 "url":         url,
                 "description": desc,
                 "score":       None,
-                "by":          e.get("author", source["name"]),
+                "by":          e.get("author", name),
                 "time":        ts,
                 "descendants": None,
                 "hn_url":      None,
                 "read_time":   max(1, round(words / 200)),
             })
-        return out
+
+        log.info(f"[RSS] {name}: {len(out)} articles OK")
+        return out, None
+
     except Exception as ex:
-        print(f"RSS [{source['name']}]: {ex}")
-        return []
+        msg = f"{type(ex).__name__}: {ex}"
+        log.error(f"[RSS] {name} FAILED — {msg}")
+        return [], msg
 
 
-# ─── Cache load ───────────────────────────────────────────────────────────────
+# ─── Refresh ──────────────────────────────────────────────────────────────────
 
-def _load() -> dict:
+def _refresh() -> None:
+    """Fetch fresh data from all sources. Keeps previous articles if fetch returns nothing."""
     now = time.time()
-    if _cache["articles"] and now - _cache["ts"] < CACHE_TTL:
-        return _cache
+    log.info("[Refresh] Starting fetch from all sources...")
 
+    errors: list[str] = []
+    source_counts: dict[str, int] = {}
+    articles: list[dict] = []
+
+    # Hacker News top stories
     try:
         hn_ids = _fetch_json(f"{HN_BASE}/topstories.json")[:30]
-    except Exception:
+        log.info(f"[HN] Got {len(hn_ids)} story IDs")
+    except Exception as ex:
+        msg = f"HN topstories: {type(ex).__name__}: {ex}"
+        log.error(f"[HN] FAILED — {ex}")
+        errors.append(msg)
         hn_ids = []
 
-    articles: list[dict] = []
-    with ThreadPoolExecutor(max_workers=15) as ex:
-        hn_futs  = [ex.submit(_hn_item, sid) for sid in hn_ids]
-        rss_futs = [ex.submit(_rss_source, src) for src in RSS_SOURCES]
+    with ThreadPoolExecutor(max_workers=15) as pool:
+        hn_futs  = {pool.submit(_hn_item, sid): sid for sid in hn_ids}
+        rss_futs = {pool.submit(_rss_source, src): src["name"] for src in RSS_SOURCES}
+
+        hn_ok = 0
         for f in as_completed(hn_futs):
             r = f.result()
-            if r: articles.append(r)
-        for f in rss_futs:
-            articles.extend(f.result())
+            if r:
+                articles.append(r)
+                hn_ok += 1
+        source_counts["Hacker News"] = hn_ok
+        log.info(f"[HN] {hn_ok}/{len(hn_ids)} valid stories")
+
+        for f in as_completed(rss_futs):
+            src_name = rss_futs[f]
+            batch, err = f.result()
+            articles.extend(batch)
+            source_counts[src_name] = len(batch)
+            if err:
+                errors.append(f"{src_name}: {err}")
 
     articles = [a for a in articles if _is_valid(a)]
     for a in articles:
@@ -174,8 +234,49 @@ def _load() -> dict:
     cutoff = now - 86400
     alerts = [a for a in articles if a["is_alert"] and a["time"] > cutoff]
 
-    _cache.update(articles=articles, alerts=alerts, ts=now)
+    if articles:
+        _cache["articles"] = articles
+        _cache["alerts"]   = alerts
+        log.info(
+            f"[Refresh] Done — {len(articles)} articles, {len(alerts)} alerts. "
+            f"Counts: {source_counts}"
+        )
+    else:
+        # Keep old articles so the UI doesn't go blank on a bad refresh
+        log.warning(
+            f"[Refresh] 0 articles fetched — retaining {len(_cache['articles'])} cached. "
+            f"Errors: {errors}"
+        )
+
+    # Always update metadata so health endpoint stays accurate
+    _cache["ts"]            = now
+    _cache["errors"]        = errors
+    _cache["source_counts"] = source_counts
+    _cache["fetch_count"]   = _cache["fetch_count"] + 1
+
+
+def _load() -> dict:
+    """Return cached articles, refreshing if stale."""
+    if _cache["articles"] and time.time() - _cache["ts"] < CACHE_TTL:
+        return _cache
+    _refresh()
     return _cache
+
+
+# ─── Startup ──────────────────────────────────────────────────────────────────
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    # Kick off the first fetch in a background thread so startup is non-blocking
+    loop = get_running_loop()
+    loop.run_in_executor(None, _refresh)
+    yield
+
+
+# ─── App ──────────────────────────────────────────────────────────────────────
+
+app = FastAPI(title="TechPulse", lifespan=lifespan)
+app.mount("/static", StaticFiles(directory="static"), name="static")
 
 
 # ─── Models ───────────────────────────────────────────────────────────────────
@@ -211,13 +312,41 @@ def service_worker():
     )
 
 
+@app.get("/api/health")
+def health():
+    age = round(time.time() - _cache["ts"]) if _cache["ts"] else None
+    return {
+        "status":          "ok",
+        "articles_cached": len(_cache["articles"]),
+        "alerts_cached":   len(_cache["alerts"]),
+        "last_fetch_ts":   _cache["ts"],
+        "last_fetch_age_s": age,
+        "cache_ttl_s":     CACHE_TTL,
+        "cache_fresh":     age is not None and age < CACHE_TTL,
+        "fetch_count":     _cache["fetch_count"],
+        "source_counts":   _cache["source_counts"],
+        "last_errors":     _cache["errors"],
+    }
+
+
 @app.get("/api/news")
 def news(category: str = Query("all")):
     data = _load()
     arts = data["articles"]
     if category != "all":
         arts = [a for a in arts if category in a.get("categories", [])]
-    return {"articles": arts, "total": len(arts), "fetched_at": data["ts"]}
+
+    resp: dict = {"articles": arts, "total": len(arts), "fetched_at": data["ts"]}
+    if not data["articles"]:
+        # No articles at all — surface debug info so we can diagnose
+        resp["debug"] = {
+            "message":      "No articles cached. Check /api/health for details.",
+            "source_counts": data["source_counts"],
+            "errors":       data["errors"],
+            "fetch_count":  data["fetch_count"],
+            "cache_age_s":  round(time.time() - data["ts"]) if data["ts"] else None,
+        }
+    return resp
 
 
 @app.get("/api/alerts")
