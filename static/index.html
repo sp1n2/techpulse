@@ -190,8 +190,14 @@ body{background:var(--bg);color:var(--text);font-family:'Inter',-apple-system,sa
 .logo-ekg{overflow:visible;flex-shrink:0}
 
 /* ── About page ── */
-#about-page{position:fixed;inset:0;background:var(--bg);z-index:90;overflow-y:auto;-webkit-overflow-scrolling:touch}
+#about-page{position:fixed;inset:0;background:var(--bg);z-index:90;overflow-y:auto;-webkit-overflow-scrolling:touch;will-change:opacity,transform;transition:opacity .45s cubic-bezier(.4,0,.2,1),transform .5s cubic-bezier(.4,0,.2,1)}
+#about-page.tp-exiting{opacity:0;transform:scale(1.03);pointer-events:none;overflow:hidden}
+@keyframes aboutReveal{from{opacity:0;transform:scale(.97)}to{opacity:1;transform:none}}
+#about-page.tp-entering{animation:aboutReveal .4s cubic-bezier(.2,.8,.4,1) both}
 #about-page.hidden{display:none}
+/* ── Cinematic glow overlay ── */
+#tp-transition{position:fixed;inset:0;z-index:95;pointer-events:none;opacity:0;background:radial-gradient(ellipse at 50% 44%,rgba(99,102,241,.62) 0%,rgba(99,102,241,.18) 42%,transparent 68%);transition:opacity .32s ease}
+#tp-transition.burst{opacity:1;transition:opacity .09s ease}
 .about-close{position:fixed;top:14px;right:16px;background:var(--bg3);border:1px solid var(--border);border-radius:8px;color:var(--text2);width:34px;height:34px;display:flex;align-items:center;justify-content:center;cursor:pointer;font-size:15px;z-index:92;transition:all .2s}
 .about-close:hover{color:var(--text);border-color:var(--text3)}
 .about-scroll{padding:56px 22px 90px;max-width:600px;margin:0 auto;display:flex;flex-direction:column;gap:64px}
@@ -268,8 +274,11 @@ body{background:var(--bg);color:var(--text);font-family:'Inter',-apple-system,sa
 </head>
 <body>
 
-<!-- About page overlay -->
-<div id="about-page" class="hidden">
+<!-- Cinematic transition glow -->
+<div id="tp-transition"></div>
+
+<!-- About page overlay — shown first on every load -->
+<div id="about-page">
   <button class="about-close" id="btn-about-close">✕</button>
   <div class="about-scroll">
     <section class="about-section about-hero">
@@ -616,7 +625,13 @@ let _aboutIO=null;
 
 function showAbout(){
   const pg=document.getElementById('about-page');
-  pg.classList.remove('hidden');
+  const wasHidden=pg.classList.contains('hidden');
+  pg.classList.remove('hidden','tp-exiting');
+  if(wasHidden){
+    pg.classList.remove('tp-entering');
+    pg.offsetWidth; // force reflow to restart animation
+    pg.classList.add('tp-entering');
+  }
   pg.scrollTop=0;
   const secs=pg.querySelectorAll('.about-section');
   secs.forEach(el=>el.classList.remove('vis'));
@@ -632,9 +647,40 @@ function showAbout(){
 }
 
 function hideAbout(){
-  document.getElementById('about-page').classList.add('hidden');
+  const pg=document.getElementById('about-page');
+  if(pg.classList.contains('hidden')) return;
   if(_aboutIO){ _aboutIO.disconnect(); _aboutIO=null; }
-  localStorage.setItem('tp_seen_about','1');
+
+  const overlay=document.getElementById('tp-transition');
+  const hero=pg.querySelector('.about-hero');
+  const feats=pg.querySelectorAll('.about-feat-row');
+  const cta=pg.querySelector('.about-cta');
+  pg.style.overflow='hidden';
+
+  // Phase 1 — stagger cards + CTA out (0–130ms)
+  if(cta) cta.style.cssText='transition:opacity .2s ease,transform .26s cubic-bezier(.4,0,1,1);opacity:0;transform:translateY(18px)';
+  feats.forEach((f,i)=>setTimeout(()=>{
+    f.style.cssText='transition:opacity .2s ease,transform .26s cubic-bezier(.4,0,1,1);opacity:0;transform:translateX('+(i%2===0?'-28px':'28px')+')';
+  }, i*50));
+
+  // Phase 2 — hero scales away + glow burst (180ms)
+  setTimeout(()=>{
+    if(hero) hero.style.cssText='transition:opacity .28s ease,transform .32s cubic-bezier(.4,0,.2,1);opacity:0;transform:scale(.93) translateY(-10px)';
+    if(overlay) overlay.classList.add('burst');
+  }, 180);
+
+  // Phase 3 — glow fades, page scales out (310ms)
+  setTimeout(()=>{ if(overlay) overlay.classList.remove('burst'); }, 310);
+  setTimeout(()=>{ pg.classList.add('tp-exiting'); }, 360);
+
+  // Phase 4 — done, reset for next open (830ms)
+  setTimeout(()=>{
+    pg.classList.add('hidden');
+    pg.classList.remove('tp-exiting');
+    pg.style.overflow='';
+    pg.querySelectorAll('.about-section').forEach(s=>{ s.classList.remove('vis'); s.style.cssText=''; });
+    feats.forEach(f=>{ f.style.cssText=''; });
+  }, 830);
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -1064,7 +1110,7 @@ function init(){
   wire();
   updateI18n();
   renderGreeting();
-  if(!localStorage.getItem('tp_seen_about')) showAbout();
+  showAbout();
   initNotifs();
 }
 
